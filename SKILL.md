@@ -35,3 +35,5 @@ order is not monotonic across its pages. List prices can be stale: use `--verify
 
 Unverified: `--sort rating|distance`, `--min/--max`, non-TWD currency, signed-out `--from-browser` login flow, keyring login,
 member tiers other than 白銀. NEVER book, hold, or pay; this CLI has no such command.
+
+CDP setup: if `trip doctor` shows `cdp` failing and a command needs Edge, ask the user to start it as in README "Browser on CDP 9222" (separate `--user-data-dir`, `--remote-debugging-port=9222`). Never launch a browser yourself.

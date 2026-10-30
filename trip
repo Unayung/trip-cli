@@ -1,0 +1,1512 @@
+#!/usr/bin/env python3
+"""
+trip - agent-native CLI for Trip.com Taiwan (tw.trip.com, zh-TW, TWD) hotels. No booking.
+
+Zero dependencies (Python 3.8+ stdlib). Every command supports --json and
+returns the {ok, data|error} envelope used by the other ~/Projects CLIs.
+Exit codes: 0 ok, 1 api, 2 usage, 3 auth, 4 net/blocked.
+
+Endpoints, measured 2026-10-30 with real requests (CDP Network capture on a
+background tab of the user's signed-in Edge, then replayed with plain HTTPS)
+---------------------------------------------------------------------------
+Trip.com (Ctrip) "SOA2" JSON-over-POST services. Every hotel body carries a
+`head` {platform:"PC", bu:"IBU", group:"trip", locale:"zh-TW", region:"TW",
+currency:"TWD", ...}; headers x-ctx-Locale / x-ctx-Currency / locale /
+currency. The site's own JS also adds anti-bot headers (phantom-token,
+w-payload-source, x-ctx-wclient-req). Measured: those are NOT needed when the
+request carries a signed-in session cookie (`cticket`); without a session
+the hotel services answer 200 with an empty body (ResponseStatus extension
+ResultId=201, no `data`) even with a fresh anonymous GUID cookie, and even
+with replayed anti-bot headers. So every hotel call here goes over plain
+HTTPS with the saved session cookies (`trip login`). `--via browser` runs the
+same POST as fetch() inside a background tab of Edge (CDP 127.0.0.1:9222) on
+https://tw.trip.com/robots.txt (measured: sets no cookies).
+
+  POST https://tw.trip.com/restapi/soa2/34951/getHotelKeywords      (http, works anonymous too)
+       typeahead. body {queryInfo:{keyword, actionType:"destination"}, head}.
+       -> data.mainKeywordList.keywords[]: keyword.keywordContentInfo
+       (keyword, displayTexts SUB_TITLE), controlInfo.keywordFilterItem.data
+       (filterID "13|6790054" landmark / "19|617" city / "31|<id>" hotel,
+       value, subType), controlInfo.regionInfo.basicCityModel (cityId,
+       countryId). 心齋橋 -> landmark 13|6790054 in city 219 (大阪).
+  POST https://tw.trip.com/restapi/soa2/34951/fetchHotelList        (http + session)
+       search. body {date:{dateType:1,dateInfo:{checkInDate:"YYYYMMDD",
+       checkOutDate}}, destination:{type:1,geo:{cityId,countryId},keyword},
+       extraFilter:{childInfoItems:[{age}],sessionId}, filters:[...],
+       roomQuantity, paging:{pageIndex,pageSize}, hotelIdFilter:
+       {hotelAldyShown:[ids already shown]}, head}.
+       filters (labels measured from the zh-TW list page SSR):
+         29|1  value "<rooms>|<adults>"; 29|2|<age> value "2|<age>" per child
+         80|1|0 value "1" 住宿總價 (含稅及附加費)   <- always sent: price = stay total
+         80|2|1 value "2" 每間每晚價格 (含稅項及費用) (site default, not used)
+         17|1 Trip.com 推薦, 17|3 最低價 (含稅), 17|4 最高價 (含稅),
+         17|6 最受好評, 17|5 直線距離 (由近到遠)
+         16|N 星級, 23|10 免費取消, 5|1 包含早餐, plus the typeahead filter.
+       -> data.hotelList[]: hotelInfo.summary.hotelId, nameInfo, hotelStar,
+       commentInfo (commentScore, commenterNumber), positionInfo
+       (positionDesc "距離選擇的地點370公尺", zoneNames), advertiseInfo
+       (isAdHotel/isAdSolt = sponsored), roomInfo[0].priceInfo.price (with
+       80|1: the stay total incl. taxes/fees, e.g. "3 張床 × 3晚 含稅項及費用
+       可能額外收費"), roomInfo[0].roomTags (advantageTags 免費取消/含早餐,
+       promotionTags e.g. 白銀會員優惠 = member price);
+       data.hotelListAddtionInfo.hotelTotalCount / isLastPage.
+       Measured: page 2 with hotelAldyShown = page-1 ids -> 0 overlap; the
+       site's own price order is NOT strictly monotonic (1837 then 1833) ->
+       the CLI re-sorts its pool by total. Ad cards appear in 推薦 order
+       (e.g. 688205, 1068771 with isAdHotel=true) -> dropped.
+       Children change results: 心齋橋 3 adults -> 4602 hotels, cheapest a
+       NT$399/bed dorm; 3 adults + child 7 -> 4462 hotels.
+       Member prices: same list page anonymous vs signed in: hotel 132129124
+       TWD17,433 vs TWD15,977 (others identical).
+  GET  https://tw.trip.com/hotels/detail/?hotelId=..&checkIn=..        (http, SSR)
+       Next.js flight payload (self.__next_f) contains hotelDetailResponse:
+       hotelBaseInfo (name, starInfo, isFavoriteHotel), hotelPositionInfo
+       (address, zoneName), hotelComment.comment (score, totalComment),
+       hotelPolicyInfo.checkInAndOut, hotelFacilityPopV2; authInfo.isLogin.
+  POST https://tw.trip.com/restapi/soa2/33269/getHotelRoomListOversea (http + session)
+       rooms (also used for Taiwan hotels; measured with Taipei id 3182366).
+       body {search:{hotelId, checkIn, checkOut, roomQuantity, adult,
+       childInfoItems:[{age,bed:-1,meal:-1}], ...}, head}.
+       -> data.roomList[] (the rates the page SHOWS for this party:
+       key=physical room id, subRoomList[].skey), physicRoomMap (name,
+       bedInfo, areaInfo), saleRoomMap[skey]: comparingAmount (= stay total,
+       equals priceDetail.priceInfo.totalPrice for all 17 rates checked),
+       priceInfo.price (per unit per night), cancelInfo (title,
+       ladderDetailInfo[ladderType=Free].localTimeDesc), mealInfo.title
+       ("含 2 客早餐"; absent = no meal), paymentInfo.paymentTitleNew
+       (線上預付), guestCountInfo.guestCount, bookingStatusInfo
+       (remainRoomQuantity, isBooking). CAVEAT: saleRoomMap also holds rates
+       the page hides ("此房間無法容納您搜尋的旅客人數") -> only roomList rates
+       are used; the others are counted as hidden_rates.
+  POST https://tw.trip.com/restapi/soa2/27024/ssoIsLoginAndGetAccountInfo  (http + session)
+       {head} -> isLogin "T", message 登入成功, maskedEmail, thirdTypes.
+  POST https://tw.trip.com/restapi/soa2/27024/getUserInfo           (http + session)
+       {locale, accessCode:"IBUPCAUTEHNTICATE", head} -> vipGrade (1 for this
+       account; search cards show 白銀會員優惠 -> 1 = 白銀/Silver; other grade
+       numbers not seen).
+  POST https://online.trip.com/restapi/soa2/26974/getAllOrders.json (http + session)
+       trips, read-only. {OrderStatusClassify:"All", Count, ...} ->
+       OrderEnities[] (OrderID, OrderName, OrderStatusName, OrderTotalPrice,
+       HotelOrderItems[] CheckInDate "/Date(ms+0800)/", NightAmount, RoomType).
+  POST https://www.trip.com/restapi/soa2/26974/json/GetMyFavorites  (http + session)
+       saved list. {QueryList:[{BizType:"HOTEL"}], ReturnCount, ...} ->
+       TotalRecord, FavoriteList[] (FavoriteID, ProductID, ProductName).
+  POST https://www.trip.com/restapi/soa2/26974/json/GetBizList      (http + session)
+       favourite counts per category (BizList [] when nothing is saved).
+  saved add/rm: the write call is not visible on the page target (not
+       captured; probably sent from a worker), so the CLI clicks the hotel
+       page's own 收藏 button (div.collectButton_hotelOverview_collectBtn*,
+       icon class *_collectIcon_selected / *_collectIcon_unselected) in a
+       background tab and then VERIFIES with GetMyFavorites. Measured: the
+       click added FavoriteID 213045142 and a second click removed it; the
+       button's aria-label stays "收藏" either way.
+
+Cookies: tw.trip.com pages set ibulocale/ibulanguage/cookiePricesDisplayed
+with Domain=trip.com (measured), which would flip the user's hk.trip.com
+locale in Edge. The CLI never changes them over plain HTTPS (it only
+overrides them in its own Cookie header), and the browser path snapshots
+those three cookies before opening a tab and restores them after.
+
+NEVER called: any booking, checkout, hold, payment or order-creation path.
+Unofficial. Undocumented, private API - it can break without warning.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import hashlib
+import html as htmllib
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+VERSION = "0.1.0"
+CDP = os.environ.get("TRIP_CDP", "http://127.0.0.1:9222")
+ORIGIN = "https://tw.trip.com"
+SOA = ORIGIN + "/restapi/soa2"
+EX_OK, EX_ERR, EX_USAGE, EX_AUTH, EX_NET = 0, 1, 2, 3, 4
+DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0")
+STATE_DIR = os.path.expanduser(os.environ.get("TRIP_HOME", "~/.config/trip"))
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+KEYRING_SERVICE = "trip-cli"
+KR_CHUNK = 4000
+LOCALE_COOKIES = ("ibulanguage", "ibulocale", "cookiePricesDisplayed")
+KEEP_HOSTS = ("trip.com", "tw.trip.com", "www.trip.com", "online.trip.com")
+PACE = 0.8  # seconds between site calls inside one command
+
+SORTS = {"recommended": "17|1", "price": "17|3", "price-desc": "17|4", "rating": "17|6", "distance": "17|5"}
+VIP = {1: "白銀 (Silver)"}  # only grade 1 observed (matches the 白銀會員優惠 search tag)
+
+
+class Net(Exception):
+    pass
+
+
+class Blocked(Net):
+    pass
+
+
+class Auth(Exception):
+    pass
+
+
+class ApiError(Exception):
+    def __init__(self, msg, detail=None):
+        super().__init__(msg)
+        self.detail = detail
+
+
+class Usage(ApiError):
+    pass
+
+
+# ---------------------------------------------------------------- envelope
+def ok(data):
+    return {"ok": True, "data": data}
+
+
+def err(msg, code=EX_ERR, **detail):
+    return {"ok": False, "error": {"message": msg, "code": code, "detail": detail or None}}
+
+
+def emit(payload, as_json, human=None):
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif payload.get("ok"):
+        print(human() if callable(human) else
+              (human if human is not None else json.dumps(payload["data"], ensure_ascii=False, indent=2)))
+    else:
+        print(payload["error"]["message"], file=sys.stderr)
+    return EX_OK if payload.get("ok") else payload["error"]["code"]
+
+
+def _w(text):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(text))
+
+
+def table(rows, headers):
+    if not rows:
+        return "(no rows)"
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(_w("" if c is None else c) for c in col) for col in cols]
+    pad = lambda t, w: str(t) + " " * max(0, w - _w(t))  # noqa: E731
+    out = ["  ".join(pad(h, w) for h, w in zip(headers, widths)).rstrip(),
+           "  ".join("-" * w for w in widths)]
+    for r in rows:
+        out.append("  ".join(pad("" if c is None else c, w) for c, w in zip(r, widths)).rstrip())
+    return "\n".join(out)
+
+
+def clip(text, n):
+    text = (text or "").replace("\n", " ").strip()
+    if _w(text) <= n:
+        return text
+    out = ""
+    for c in text:
+        if _w(out + c) > n - 1:
+            break
+        out += c
+    return out + "…"
+
+
+def money(v, currency="TWD"):
+    if v is None:
+        return ""
+    sym = "NT$" if currency == "TWD" else currency + " "
+    return f"{sym}{v:,.0f}"
+
+
+def num(text):
+    m = re.search(r"-?[\d,]+(?:\.\d+)?", str(text or ""))
+    return float(m.group(0).replace(",", "")) if m else None
+
+
+def untag(s):
+    return re.sub(r"\s+", " ", re.sub(r"\{/?\d\}", "", s or "")).strip()
+
+
+# -------------------------------------------------------- CDP (stdlib ws)
+class WS:
+    def __init__(self, url, timeout=60):
+        if not url.startswith("ws://"):
+            raise Net(f"unsupported websocket url {url}")
+        hostport, path = url[5:].split("/", 1)
+        host, port = hostport.rsplit(":", 1)
+        try:
+            self.s = socket.create_connection((host, int(port)), timeout=timeout)
+        except OSError as e:
+            raise Net(f"cannot reach browser at {hostport}: {e}")
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.s.sendall((f"GET /{path} HTTP/1.1\r\nHost: {hostport}\r\n"
+                        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                        f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.s.recv(4096)
+            if not chunk:
+                raise Net("websocket handshake closed")
+            buf += chunk
+        if b" 101 " not in buf.split(b"\r\n")[0]:
+            raise Net("websocket handshake refused (start Edge with --remote-allow-origins='*')")
+        self.rest = buf.split(b"\r\n\r\n", 1)[1]
+        self.n = 0
+
+    def _recv(self, n):
+        while len(self.rest) < n:
+            chunk = self.s.recv(65536)
+            if not chunk:
+                raise Net("browser closed the connection")
+            self.rest += chunk
+        out, self.rest = self.rest[:n], self.rest[n:]
+        return out
+
+    def _send(self, obj):
+        data = json.dumps(obj).encode()
+        hdr = bytearray([0x81])
+        n = len(data)
+        if n < 126:
+            hdr.append(0x80 | n)
+        elif n < 65536:
+            hdr.append(0x80 | 126)
+            hdr += struct.pack(">H", n)
+        else:
+            hdr.append(0x80 | 127)
+            hdr += struct.pack(">Q", n)
+        mask = os.urandom(4)
+        hdr += mask
+        self.s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def _recv_msg(self):
+        msg = b""
+        while True:
+            b0, b1 = self._recv(2)
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._recv(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._recv(8))[0]
+            payload = self._recv(n)
+            op = b0 & 0x0F
+            if op == 8:
+                raise Net("browser closed the websocket")
+            if op in (9, 10):
+                continue
+            msg += payload
+            if b0 & 0x80:
+                return json.loads(msg)
+
+    def call(self, method, **params):
+        self.n += 1
+        i = self.n
+        self._send({"id": i, "method": method, "params": params})
+        while True:
+            m = self._recv_msg()
+            if m.get("id") == i:
+                if "error" in m:
+                    raise Net(f"{method}: {m['error'].get('message')}")
+                return m["result"]
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+def _http_json(path):
+    try:
+        with urllib.request.urlopen(CDP + path, timeout=5) as r:
+            return json.loads(r.read())
+    except OSError as e:
+        raise Net(f"no browser on {CDP} ({e}). Edge must already run with --remote-debugging-port=9222")
+
+
+def _set_cdp(cdp):
+    global CDP
+    if cdp:
+        CDP = cdp
+
+
+def _keep_cookie(c):
+    return (c.get("domain") or "").lstrip(".") in KEEP_HOSTS
+
+
+def edge_cookies():
+    """Trip.com cookies of the CDP browser (browser-level read, no tab)."""
+    ver = _http_json("/json/version")
+    b = WS(ver["webSocketDebuggerUrl"])
+    try:
+        cks = b.call("Storage.getCookies")["cookies"]
+    finally:
+        b.close()
+    keep = [{"name": c["name"], "value": c["value"], "domain": c["domain"]} for c in cks if _keep_cookie(c)]
+    return keep, ver.get("User-Agent")
+
+
+class Browser:
+    """One background tab of the user's Edge, closed on exit, never focused.
+    Snapshots the shared .trip.com locale cookies and restores them on close."""
+
+    def __init__(self, url=ORIGIN + "/robots.txt", debug=False):
+        self.debug = debug
+        self._url = url
+        self.ver = _http_json("/json/version")
+        self.b = WS(self.ver["webSocketDebuggerUrl"])
+        self.snap = [c for c in self.b.call("Storage.getCookies")["cookies"]
+                     if c.get("domain") == ".trip.com" and c["name"] in LOCALE_COOKIES]
+        self.tid = self.b.call("Target.createTarget", url=url, background=True)["targetId"]
+        try:
+            tgt = next(x for x in _http_json("/json/list") if x["id"] == self.tid)
+            self.p = WS(tgt["webSocketDebuggerUrl"], timeout=90)
+            self._wait_ready(urllib.parse.urlparse(url).netloc)
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+    def _wait_ready(self, host, limit=30):
+        t0, retried = time.time(), False
+        while time.time() - t0 < limit:
+            r = self.eval("location.host + '|' + document.readyState")
+            if r and r.startswith(host) and "|loading" not in r:
+                return
+            if r and r.startswith("chromewebdata") and not retried and time.time() - t0 > 4:
+                retried = True
+                try:
+                    self.p.call("Page.navigate", url=self._url)
+                except Net:
+                    pass
+            time.sleep(0.7)
+        raise Blocked(f"{host} did not load in the background tab (bot check?)")
+
+    def eval(self, expr):
+        r = self.p.call("Runtime.evaluate", expression=expr, awaitPromise=True, returnByValue=True)
+        if r.get("exceptionDetails"):
+            raise ApiError("page script failed: " + str(
+                r["exceptionDetails"].get("exception", {}).get("description") or r["exceptionDetails"].get("text")))
+        return r.get("result", {}).get("value")
+
+    def navigate(self, url):
+        self._url = url
+        self.p.call("Page.navigate", url=url)
+        self._wait_ready(urllib.parse.urlparse(url).netloc)
+
+    def fetch(self, method, url, body=None, headers=None):
+        opts = {"method": method, "credentials": "include", "headers": headers or {}}
+        if body is not None:
+            opts["body"] = body
+        js = ("fetch(%s,%s).then(async r=>({http:r.status,text:await r.text()}))" % (json.dumps(url), json.dumps(opts)))
+        r = self.eval(js)
+        return r["http"], r["text"]
+
+    def close(self):
+        # Edge quits when its last page target closes (measured on hotels-cli):
+        # if ours is the only page left, blank it instead of closing it.
+        try:
+            pages = [t for t in self.b.call("Target.getTargets").get("targetInfos", []) if t.get("type") == "page"]
+            only = len(pages) <= 1 and any(t.get("targetId") == self.tid for t in pages)
+        except Exception:
+            only = False
+        try:
+            if getattr(self, "tid", None):
+                if only:
+                    self.p.call("Page.navigate", url="about:blank")
+                else:
+                    self.b.call("Target.closeTarget", targetId=self.tid)
+        except Exception:
+            pass
+        try:  # put the user's locale cookies back exactly as found
+            now = {c["name"]: c.get("value") for c in self.b.call("Storage.getCookies")["cookies"]
+                   if c.get("domain") == ".trip.com" and c["name"] in LOCALE_COOKIES}
+            fix = [{k: c[k] for k in ("name", "value", "domain", "path", "secure", "httpOnly", "sameSite", "expires")
+                    if k in c} for c in self.snap if now.get(c["name"]) != c["value"]]
+            if fix:
+                self.b.call("Storage.setCookies", cookies=fix)
+        except Exception:
+            pass
+        for w in (getattr(self, "p", None), getattr(self, "b", None)):
+            if w:
+                w.close()
+
+
+# ------------------------------------------------------------------ state
+def _keyring(op, secret=None, acct="default"):
+    try:
+        if sys.platform == "darwin":
+            cmd = {"set": ["security", "add-generic-password", "-U", "-a", acct, "-s", KEYRING_SERVICE, "-w", secret],
+                   "get": ["security", "find-generic-password", "-a", acct, "-s", KEYRING_SERVICE, "-w"],
+                   "del": ["security", "delete-generic-password", "-a", acct, "-s", KEYRING_SERVICE]}[op]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        else:
+            base = ["service", KEYRING_SERVICE, "account", acct]
+            cmd = {"set": ["secret-tool", "store", "--label=trip-cli"] + base,
+                   "get": ["secret-tool", "lookup"] + base,
+                   "del": ["secret-tool", "clear"] + base}[op]
+            r = subprocess.run(cmd, input=secret if op == "set" else None, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Auth("no keyring tool (macOS `security` / Linux `secret-tool`)")
+    if op == "get":
+        return r.stdout.strip() if r.returncode == 0 else None
+    if op == "set" and r.returncode != 0:
+        raise Auth("keyring write failed: " + r.stderr.strip())
+    return True
+
+
+def keyring_save(cookies):
+    blob = json.dumps(cookies, separators=(",", ":"))
+    parts = [blob[i:i + KR_CHUNK] for i in range(0, len(blob), KR_CHUNK)]
+    for i, part in enumerate(parts):
+        _keyring("set", part, f"default.{i}")
+    return len(parts)
+
+
+def keyring_load(n):
+    parts = [_keyring("get", acct=f"default.{i}") for i in range(n or 0)]
+    if not n or any(p is None for p in parts):
+        raise Auth("saved keyring session is missing - run `trip login --keyring`")
+    try:
+        return json.loads("".join(parts))
+    except ValueError:
+        raise Auth("saved keyring session is corrupt - run `trip login --keyring`")
+
+
+def keyring_clear(n):
+    for i in range(max(n or 0, 1)):
+        _keyring("del", acct=f"default.{i}")
+    _keyring("del")
+
+
+def clean_cookie(raw):
+    raw = (raw or "").strip()
+    if raw.lower().startswith("cookie:"):
+        raw = raw.split(":", 1)[1].strip()
+    pairs = [p.strip() for p in raw.replace("\n", ";").split(";")]
+    good_re = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+=[\x21-\x7e]*$")
+    good = [p for p in pairs if p and good_re.match(p)]
+    if not any(p.startswith("cticket=") and len(p) > 9 for p in good):
+        raise Auth("that does not look like a signed-in Trip.com Cookie header (no cticket). DevTools > Network > "
+                   "a tw.trip.com request > Request Headers > copy the value of `Cookie`")
+    return "; ".join(good)
+
+
+def header_to_cookies(header):
+    return [{"name": p.split("=", 1)[0].strip(), "value": p.split("=", 1)[1].strip(), "domain": ".trip.com"}
+            for p in header.split(";") if "=" in p]
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+    except FileNotFoundError:
+        st = {}
+    except (OSError, ValueError) as e:
+        raise ApiError(f"state file unreadable: {e}")
+    if os.environ.get("TRIP_COOKIE"):
+        st["cookies"], st["source"] = header_to_cookies(clean_cookie(os.environ["TRIP_COOKIE"])), "env"
+    elif st.get("cookie_in_keyring"):
+        try:
+            st["cookies"] = keyring_load(st.get("keyring_parts"))
+        except Auth as e:
+            st["cookies"], st["keyring_error"] = [], str(e)
+        st["source"] = "keyring"
+    elif st.get("cookies"):
+        st["source"] = "file"
+    return st
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    out = {k: v for k, v in st.items() if k not in ("source", "keyring_error")}
+    if out.get("cookie_in_keyring"):
+        out.pop("cookies", None)
+    tmp = STATE_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_FILE)
+
+
+def signed_in(cookies):
+    return any(c["name"] == "cticket" and c.get("value") for c in cookies or [])
+
+
+def cookie_header(cookies, url, currency):
+    host = urllib.parse.urlparse(url).hostname or ""
+    vals = {}
+    for c in cookies or []:
+        d = c.get("domain") or ".trip.com"
+        if host == d.lstrip(".") or (d.startswith(".") and host.endswith(d)) or d == "trip.com":
+            if d.startswith(".") or c["name"] not in vals:
+                vals[c["name"]] = c["value"]
+    # Only in our own request: Taiwan site locale, whatever Edge has (measured zh_hk/HKD).
+    vals.update(ibulocale="zh_tw", ibulanguage="TW", cookiePricesDisplayed=currency)
+    return "; ".join(f"{k}={v}" for k, v in vals.items())
+
+
+# -------------------------------------------------------------- transport
+class Client:
+    def __init__(self, args, st=None):
+        self.args = args
+        self.st = st if st is not None else load_state()
+        self.debug = getattr(args, "debug", False)
+        self.currency = (getattr(args, "currency", None) or "TWD").upper()
+        self.via = getattr(args, "via", "auto")
+        self.br = None
+        self.ua = os.environ.get("TRIP_UA") or self.st.get("ua") or DEFAULT_UA
+        self._calls = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        if self.br:
+            self.br.close()
+            self.br = None
+
+    def browser(self):
+        if not self.br:
+            self.br = Browser(debug=self.debug)
+        return self.br
+
+    def _headers(self, url):
+        return {"content-type": "application/json", "accept": "application/json", "locale": "zh-TW",
+                "currency": self.currency, "x-ctx-Locale": "zh-TW", "x-ctx-Currency": self.currency,
+                "x-ctx-Country": "TW", "cookieOrigin": ORIGIN}
+
+    def _http(self, method, url, body=None, headers=None):
+        h = {"User-Agent": self.ua, "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8", "Origin": ORIGIN,
+             "Referer": ORIGIN + "/hotels/"}
+        h.update(headers or {})
+        if self.st.get("cookies"):
+            h["Cookie"] = cookie_header(self.st["cookies"], url, self.currency)
+        data = body.encode() if isinstance(body, str) else body
+        if self.debug:
+            print(f"> {method} {url} {(body or '')[:300]}", file=sys.stderr)
+        req = urllib.request.Request(url, data=data, headers=h, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                code, text = r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            code, text = e.code, e.read().decode("utf-8", "replace")
+        except OSError as e:
+            raise Net(f"{urllib.parse.urlparse(url).netloc}: {e}")
+        if self.debug:
+            print(f"< {code} {text[:300]}", file=sys.stderr)
+        return code, text
+
+    def _pace(self):
+        if self._calls:
+            time.sleep(PACE)
+        self._calls += 1
+
+    def get(self, url):
+        self._pace()
+        if self.via == "browser":
+            return self.browser().fetch("GET", url)
+        return self._http("GET", url)
+
+    def soa(self, url, body, session=True, data_key="data"):
+        """POST a SOA2 JSON body. Returns the parsed reply."""
+        if session and not signed_in(self.st.get("cookies")) and self.via != "browser":
+            raise Auth("not signed in - run `trip login` (Trip.com hotel services return an empty "
+                       "anti-bot reply without a session; measured)")
+        self._pace()
+        raw = json.dumps(body, ensure_ascii=False)
+        hdr = self._headers(url)
+        if self.via == "browser":
+            code, text = self.browser().fetch("POST", url, raw, hdr)
+        else:
+            code, text = self._http("POST", url, raw.encode(), hdr)
+        if code in (403, 429, 432) or (code >= 500 and "<" in text[:200]):
+            raise Blocked(f"{urllib.parse.urlparse(url).path}: HTTP {code} (bot wall?)")
+        try:
+            d = json.loads(text)
+        except ValueError:
+            raise ApiError(f"{url.split('?')[0]}: non-JSON reply (HTTP {code})", {"http": code, "body": text[:300]})
+        if code >= 400:
+            raise ApiError(f"{url.split('?')[0]}: HTTP {code}", {"http": code, "body": text[:300]})
+        rs = d.get("ResponseStatus") or {}
+        ext = {(e.get("id") or e.get("Id")): (e.get("value") or e.get("Value")) for e in rs.get("Extension") or []}
+        if data_key and data_key not in d and ext.get("ResultId") == "201":
+            if self.via == "auto" and not self.br:
+                if self.debug:
+                    print("note: empty anti-bot reply over HTTP, retrying in a background Edge tab", file=sys.stderr)
+                self.via = "browser"
+                try:
+                    return self.soa(url, body, session, data_key)
+                finally:
+                    self.via = "auto"
+            raise Auth("Trip.com returned an empty anti-bot reply (ResultId 201): the session is missing or "
+                       "expired - run `trip login`")
+        if rs.get("Ack") not in (None, "Success"):
+            raise ApiError(f"{url.split('?')[0]}: {rs.get('Ack')} {rs.get('Errors')}"[:400])
+        return d
+
+    def head(self):
+        return {"platform": "PC", "cver": "0", "bu": "IBU", "group": "trip", "aid": "", "sid": "", "ouid": "",
+                "locale": "zh-TW", "region": "TW", "timezone": "8", "currency": self.currency,
+                "pageId": "10320668148", "guid": "", "isSSR": False}
+
+    def account_head(self):
+        cid = next((c["value"] for c in self.st.get("cookies") or [] if c["name"] == "GUID"), "")
+        return {"cid": cid, "ctok": "", "cver": "1.0", "lang": "01", "sid": "8888", "syscode": "09", "auth": "",
+                "xsid": "", "extension": [], "Locale": "zh-TW", "Language": "tw", "Currency": self.currency,
+                "ClientID": cid}
+
+
+# --------------------------------------------------------------- helpers
+def parse_date(s):
+    try:
+        return dt.date.fromisoformat(s)
+    except Exception:
+        raise Usage(f"bad date {s!r}, expected YYYY-MM-DD")
+
+
+def stay(args):
+    ci, co = parse_date(args.checkin), parse_date(args.checkout)
+    if co <= ci:
+        raise Usage("--checkout must be after --checkin")
+    if args.adults < 1 or args.rooms < 1:
+        raise Usage("--adults and --rooms must be >= 1")
+    if args.rooms > args.adults:
+        raise Usage("--rooms cannot exceed --adults")
+    return ci, co, (co - ci).days
+
+
+def hotel_id(ref):
+    ref = str(ref).strip()
+    if re.fullmatch(r"\d+", ref):
+        return int(ref)
+    m = re.search(r"[?&]hotel[Ii][dD]=(\d+)", ref) or re.search(r"hotel-detail-(\d+)", ref)
+    if not m:
+        raise Usage(f"not a Trip.com hotel id or URL: {ref!r}")
+    return int(m.group(1))
+
+
+def hotel_url(hid, args):
+    q = {"hotelId": hid, "checkIn": args.checkin, "checkOut": args.checkout, "adult": args.adults,
+         "children": len(args.children), "crn": args.rooms, "curr": args.currency or "TWD", "locale": "zh-TW"}
+    if args.children:
+        q["ages"] = ",".join(str(a) for a in args.children)
+    return ORIGIN + "/hotels/detail/?" + urllib.parse.urlencode(q)
+
+
+def ms_date(s):
+    m = re.search(r"/Date\((-?\d+)([+-]\d{2})(\d{2})\)/", s or "")
+    if not m:
+        return None
+    off = dt.timedelta(hours=int(m.group(2)), minutes=int(m.group(3)) * (1 if m.group(2)[0] == "+" else -1))
+    return (dt.datetime.fromtimestamp(int(m.group(1)) / 1000, dt.timezone.utc) + off).date().isoformat()
+
+
+def flight_payload(html):
+    """Concatenate Next.js self.__next_f string chunks."""
+    buf = []
+    for p in re.findall(r"self\.__next_f\.push\((\[.*?\])\)</script>", html, re.S):
+        try:
+            a = json.loads(p)
+        except ValueError:
+            continue
+        if len(a) > 1 and isinstance(a[1], str):
+            buf.append(a[1])
+    return "".join(buf)
+
+
+def grab(payload, key):
+    i = payload.find(f'"{key}":')
+    if i < 0:
+        return None
+    try:
+        return json.JSONDecoder().raw_decode(payload[i + len(key) + 3:])[0]
+    except ValueError:
+        return None
+
+
+# --------------------------------------------------------------- suggest
+def keywords(cl, text):
+    d = cl.soa(SOA + "/34951/getHotelKeywords",
+               {"queryInfo": {"keyword": text, "actionType": "destination"}, "head": cl.head()}, session=False)
+    out = []
+    for k in ((d.get("data") or {}).get("mainKeywordList") or {}).get("keywords") or []:
+        kw, ctl = k.get("keyword") or {}, k.get("controlInfo") or {}
+        ci = kw.get("keywordContentInfo") or {}
+        f = (ctl.get("keywordFilterItem") or {}).get("data") or {}
+        city = (ctl.get("regionInfo") or {}).get("basicCityModel") or {}
+        sub = next((x.get("value") for x in ci.get("displayTexts") or [] if x.get("key") == "SUB_TITLE"), None)
+        ftype = f.get("type")
+        out.append({"name": ci.get("keyword"), "area": sub, "kind": {"19": "city", "13": "landmark", "11": "station",
+                    "31": "hotel"}.get(ftype, ftype), "filter_id": f.get("filterID"), "city_id": city.get("cityId"),
+                    "country_id": city.get("countryId"),
+                    "_filter": {"filterId": f.get("filterID"), "type": ftype, "value": f.get("value"),
+                                "subType": f.get("subType", "")} if f.get("filterID") else None})
+    return out
+
+
+def cmd_suggest(args):
+    with Client(args) as cl:
+        items = keywords(cl, args.text)[: args.limit]
+    pub = [{k: v for k, v in i.items() if not k.startswith("_")} for i in items]
+    return emit(ok({"query": args.text, "items": pub}), args.json, lambda: table(
+        [[i["filter_id"], i["name"], i["kind"], i["area"], i["city_id"]] for i in pub],
+        ["filter_id", "name", "kind", "area", "city_id"]))
+
+
+def resolve_destination(cl, dest, country_id):
+    if re.fullmatch(r"\d+", str(dest)):
+        return {"city_id": int(dest), "country_id": country_id or 0, "name": f"city {dest}", "filter": None,
+                "kind": "city"}
+    items = [i for i in keywords(cl, dest) if i["city_id"]]
+    if not items:
+        raise ApiError(f"no destination matched {dest!r} (try `trip suggest {dest}`)")
+    top = items[0]
+    return {"city_id": top["city_id"], "country_id": top["country_id"], "name": f"{top['name']} ({top['area']})" if top["area"] else top["name"],
+            "kind": top["kind"], "filter": None if top["kind"] == "city" else top["_filter"],
+            "filter_id": top["filter_id"]}
+
+
+# ---------------------------------------------------------------- search
+def tag_titles(tags, key):
+    return [t.get("tagTitle") or "" for t in (tags or {}).get(key) or []]
+
+
+def parse_card(h, nights, args, currency):
+    hi = h.get("hotelInfo") or {}
+    s = hi.get("summary") or {}
+    ad = hi.get("advertiseInfo") or {}
+    ri = (h.get("roomInfo") or [{}])[0] or {}
+    pi = ri.get("priceInfo") or {}
+    tags = ri.get("roomTags") or {}
+    adv, promo = tag_titles(tags, "advantageTags"), tag_titles(tags, "promotionTags")
+    expl = pi.get("priceExplanation") or ""
+    total = pi.get("price") if isinstance(pi.get("price"), (int, float)) and pi.get("price") > 0 else None
+    pos = hi.get("positionInfo") or {}
+    cm = hi.get("commentInfo") or {}
+    star = hi.get("hotelStar") or {}
+    hid = str(s.get("hotelId") or "")
+    return {
+        "id": hid,
+        "name": (hi.get("nameInfo") or {}).get("name"),
+        "stars": star.get("star"),
+        "category": (hi.get("hotelCategory") or {}).get("categoryName"),
+        "rating": num(cm.get("commentScore")),
+        "reviews": int(num(cm.get("commenterNumber")) or 0) or None,
+        "area": " / ".join(pos.get("zoneNames") or []) or None,
+        "distance": pos.get("positionDesc") or None,
+        "price_total": total,
+        "price_per_night": round(total / nights) if total else None,
+        "price": total,
+        "currency": pi.get("currency") or currency,
+        "units": untag(expl.split("含稅")[0]).strip(" ×") or None,
+        "taxes_included": "含稅" in expl,
+        "extra_charges_possible": "可能額外收費" in expl,
+        "room": (ri.get("summary") or {}).get("saleRoomName"),
+        "free_cancellation": any("免費取消" in t for t in adv),
+        "breakfast": any("早餐" in t for t in adv),
+        "member_deal": next((t for t in promo if "會員" in t), None),
+        "sponsored": bool(ad.get("isAdHotel") or ad.get("isAdSolt")),
+        "available": total is not None,
+        "url": hotel_url(hid, args),
+    }
+
+
+def search_body(cl, args, dest, sort, page, shown, session_id, size):
+    f = [{"filterId": "29|1", "type": "29", "value": f"{args.rooms}|{args.adults}"}]
+    for a in args.children:
+        f.append({"filterId": f"29|2|{a}", "type": "29", "value": f"2|{a}"})
+    f.append({"filterId": "80|1|0", "type": "80", "value": "1", "subType": "2"})
+    f.append({"filterId": sort, "type": "17", "value": sort.split("|")[1], "subType": "2"})
+    if dest["filter"]:
+        f.append(dest["filter"])
+    for s in args.stars or []:
+        f.append({"filterId": f"16|{s}", "type": "16", "value": str(s), "subType": "2"})
+    if args.free_cancel:
+        f.append({"filterId": "23|10", "type": "23", "value": "10"})
+    if args.breakfast:
+        f.append({"filterId": "5|1", "type": "5", "value": "1", "subType": "2"})
+    return {"date": {"dateType": 1, "dateInfo": {"checkInDate": args.checkin.replace("-", ""),
+                                                  "checkOutDate": args.checkout.replace("-", "")}},
+            "destination": {"type": 1, "geo": {"cityId": dest["city_id"], "countryId": dest["country_id"]},
+                            "keyword": {"word": ""}},
+            "extraFilter": {"childInfoItems": [{"age": a} for a in args.children], "sessionId": session_id},
+            "filters": f, "roomQuantity": args.rooms,
+            "paging": {"pageIndex": page, "pageSize": size, "pageCode": "10320668148"},
+            "hotelIdFilter": {"hotelAldyShown": list(shown)}, "head": cl.head()}
+
+
+SITE_PAGE = 20
+MAX_SITE_PAGES = 25
+
+
+def cmd_search(args):
+    if args.limit < 1 or args.page < 1:
+        raise Usage("--limit and --page must be >= 1")
+    _, _, nights = stay(args)
+    sort_key = args.sort or "recommended"
+    price_sort = sort_key in ("price", "price-desc")
+    offset, need = (args.page - 1) * args.limit, args.page * args.limit
+    # Trip.com's 最低價/最高價 order is only sorted within each of its pages (measured: page 4 held
+    # NT$4,430 while page 1 started at 4,497), so price sorts read a fixed pool of its first
+    # --pool hotels, re-sort that by total and serve --page windows from the same pool.
+    want = max(args.pool, need) if price_sort else need
+    dropped = {"sponsored": 0, "duplicate": 0, "no_price": 0, "price_filter": 0}
+    with Client(args) as cl:
+        dest = resolve_destination(cl, args.destination, args.country_id)
+        # same query -> same session id, so page 1 and page 2 calls see the same site pool
+        sid = hashlib.md5(json.dumps([dest["city_id"], dest.get("filter_id"), args.checkin, args.checkout,
+                                      args.adults, args.children, args.rooms, sort_key, args.stars,
+                                      args.free_cancel, args.breakfast]).encode()).hexdigest()
+        pool, seen, shown = [], set(), []
+        total_count, site_pages = None, 0
+        for page in range(1, MAX_SITE_PAGES + 1):
+            d = cl.soa(SOA + "/34951/fetchHotelList",
+                       search_body(cl, args, dest, SORTS[sort_key], page, shown, sid, SITE_PAGE))
+            data = d.get("data") or {}
+            info = data.get("hotelListAddtionInfo") or {}
+            total_count = info.get("hotelTotalCount", total_count)
+            cards = data.get("hotelList") or []
+            site_pages += 1
+            for h in cards:
+                r = parse_card(h, nights, args, cl.currency)
+                if r["id"] and r["id"] not in shown:
+                    shown.append(r["id"])
+                if r["sponsored"]:
+                    dropped["sponsored"] += 1
+                    continue
+                if r["id"] in seen:
+                    dropped["duplicate"] += 1
+                    continue
+                seen.add(r["id"])
+                if not r["available"]:
+                    dropped["no_price"] += 1
+                    continue
+                if (args.min is not None and r["price_per_night"] < args.min) or \
+                        (args.max is not None and r["price_per_night"] > args.max):
+                    dropped["price_filter"] += 1
+                    continue
+                pool.append(r)
+            if len(pool) >= want or not cards or info.get("isLastPage"):
+                break
+        if price_sort:
+            pool.sort(key=lambda r: (r["price_total"], r["id"]), reverse=(sort_key == "price-desc"))
+        items = pool[offset:need]
+        if args.verify:  # re-check each shown row against the hotel's own room list (one call per row)
+            for r in items:
+                try:
+                    c = parse_rooms(cl.soa(SOA + "/33269/getHotelRoomListOversea", rooms_body(cl, int(r["id"]), args)),
+                                    nights)["cheapest"]
+                except (ApiError, Blocked) as e:
+                    r["verified"] = {"error": str(e)}
+                    continue
+                r["verified"] = {"total": c and c["price_total"], "room": c and c["room"], "bookable": bool(c),
+                                 "matches_search": bool(c) and c["price_total"] == r["price_total"]}
+    out = {"destination": args.destination, "matched": dest["name"], "kind": dest["kind"],
+           "city_id": dest["city_id"], "filter_id": dest.get("filter_id"), "checkin": args.checkin,
+           "checkout": args.checkout, "nights": nights, "adults": args.adults, "children": args.children,
+           "rooms": args.rooms, "sort": sort_key, "page": args.page, "count": len(items),
+           "matched_total": total_count, "site_pages_read": site_pages, "dropped": dropped,
+           "price_basis": "price_total = Trip.com's stay total for the whole party (all rooms, all nights), "
+                          "labelled 含稅項及費用 (taxes and fees included) by the site; price_per_night = "
+                          "price_total / nights. Sorting uses price_total only. extra_charges_possible=true "
+                          "means the site adds 可能額外收費 (possible extra charges at the property). "
+                          "units shows what the price buys (e.g. '3 張床 × 3晚' = dorm beds).",
+           "pool_size": len(pool),
+           "paging_note": None if not price_sort else
+           f"price sorts rank the first {len(pool)} priced hotels of Trip.com's own price order, re-sorted "
+           "by price_total; --page is a window over that pool (Trip.com's order is not monotonic across its "
+           "pages, so a cheaper hotel can exist beyond the pool; raise --pool to look further).",
+           "items": items}
+    return emit(ok(out), args.json, lambda: (
+        f"matched: {dest['name']} [{dest['kind']}] city {dest['city_id']}, {total_count} hotels, "
+        f"{nights} night(s), page {args.page}; prices = stay total incl. taxes/fees\n"
+        + table([[r["id"], clip(r["name"], 30), r["stars"] or "", f"{r['rating'] or ''}({r['reviews'] or 0})",
+                  money(r["price_total"], cl.currency), money(r["price_per_night"], cl.currency),
+                  clip(r["room"], 16), clip(r["units"], 12), ("免取消 " if r["free_cancellation"] else "") + ("含早 " if r["breakfast"] else "")
+                  + ("會員 " if r["member_deal"] else "") + ("+費 " if r["extra_charges_possible"] else ""),
+                  clip(r["distance"] or r["area"], 22)]
+                 + ([("ok" if r["verified"].get("matches_search") else
+                      "SOLD OUT" if r["verified"].get("bookable") is False else
+                      money(r["verified"].get("total"), cl.currency) or "ERR")] if args.verify else [])
+                 for r in items],
+                ["id", "name", "★", "rating", "total", "/night", "room", "units", "flags", "where"]
+                + (["verified"] if args.verify else []))
+        + f"\ndropped: {dropped}"))
+
+
+# ----------------------------------------------------------------- rooms
+def rooms_body(cl, hid, args):
+    return {"search": {"isRSC": True, "isSSR": False, "hotelId": hid, "roomId": 0,
+                       "checkIn": args.checkin.replace("-", ""), "checkOut": args.checkout.replace("-", ""),
+                       "roomQuantity": args.rooms, "adult": args.adults,
+                       "childInfoItems": [{"age": a, "bed": -1, "meal": -1} for a in args.children],
+                       "priceType": None, "hotelUniqueKey": "", "mustShowRoomList": [],
+                       "location": {"geo": {"cityID": 0}}, "filters": [],
+                       "meta": {"fgt": -1, "roomkey": "", "minCurr": "", "minPrice": "", "roomToken": ""},
+                       "cancelPolicyType": 0, "fixSubhotel": 0, "listTraceId": "",
+                       "extras": {"exposeBedInfos": "T", "enableChildAgeGroup": "T", "needEntireSetRoomDesc": "T",
+                                  "closeOnlineRoomListOptimize": True}},
+            "head": cl.head()}
+
+
+def parse_rate(skey, s, nights):
+    ci = s.get("cancelInfo") or {}
+    free_until = next((x.get("localTimeDesc") for x in ci.get("ladderDetailInfo") or []
+                       if x.get("ladderType") == "Free"), None)
+    pi = s.get("priceInfo") or {}
+    bs = s.get("bookingStatusInfo") or {}
+    total = s.get("comparingAmount")
+    total = total if isinstance(total, (int, float)) and total > 0 else None
+    expl = pi.get("priceExplanation") or ""
+    meal = (s.get("mealInfo") or {}).get("title")
+    return {"rate_id": skey,
+            "price_total": total, "price_per_night": round(total / nights) if total else None,
+            "unit_price_per_night": pi.get("price"), "currency": pi.get("currency"),
+            "price_note": untag(expl.replace("\n", " ")) or None,
+            "taxes_included": "含稅" in expl or "總價" in expl,
+            "extra_charges_possible": "可能額外收費" in expl,
+            "breakfast": meal, "cancellation": ci.get("title"), "free_cancel_until": free_until,
+            "payment": (s.get("paymentInfo") or {}).get("paymentTitleNew"),
+            "confirmation": (s.get("confirmInfo") or {}).get("title"),
+            "max_guests": (s.get("guestCountInfo") or {}).get("guestCount"),
+            "rooms_left": bs.get("remainRoomQuantity"),
+            "bookable": bool(bs.get("isBooking")) and not bs.get("isFullRoom"),
+            "member_or_promo": [p.get("title") for p in (s.get("totalPriceInfo") or {}).get("promotionItems") or []],
+            "label": (s.get("titleInfo") or {}).get("title") or None}
+
+
+def parse_rooms(d, nights):
+    data = d.get("data") or {}
+    phys, sale = data.get("physicRoomMap") or {}, data.get("saleRoomMap") or {}
+    rooms, shown = [], set()
+    for r in data.get("roomList") or []:
+        p = phys.get(str(r.get("key"))) or {}
+        rates = []
+        for sub in r.get("subRoomList") or []:
+            s = sale.get(sub.get("skey"))
+            if s:
+                shown.add(sub["skey"])
+                rates.append(parse_rate(sub["skey"], s, nights))
+        rooms.append({"room_id": r.get("key"), "name": p.get("name"),
+                      "beds": untag((p.get("bedInfo") or {}).get("title")) or None,
+                      "size": (p.get("areaInfo") or {}).get("title"), "rent": p.get("rent"),
+                      "smoking": (p.get("smokeInfo") or {}).get("title"),
+                      "window": (p.get("windowInfo") or {}).get("title"), "rates": rates})
+    hidden = [k for k in sale if k not in shown]
+    reasons = sorted({h for k in hidden for h in ((sale[k].get("guestCountInfo") or {}).get("childHover") or [])})
+    bookable = [(rt, rm) for rm in rooms for rt in rm["rates"] if rt["bookable"] and rt["price_total"]]
+    cheapest = min(bookable, key=lambda x: x[0]["price_total"]) if bookable else None
+    return {"rooms": rooms, "sold_out": bool(data.get("isRoomListSoldOut")),
+            "hidden_rates": len(hidden), "hidden_reason": reasons or None,
+            "cheapest": None if not cheapest else {"room": cheapest[1]["name"], **cheapest[0]}}
+
+
+def hotel_static(cl, hid, args):
+    code, html = cl.get(hotel_url(hid, args))
+    if code >= 400:
+        return {"static_error": f"detail page HTTP {code}"}
+    pl = flight_payload(html)
+    det = grab(pl, "hotelDetailResponse") or {}
+    if not det:
+        return {"static_error": "detail page carried no hotelDetailResponse"}
+    base, pos = det.get("hotelBaseInfo") or {}, det.get("hotelPositionInfo") or {}
+    com = (det.get("hotelComment") or {}).get("comment") or {}
+    pol = ((det.get("hotelPolicyInfo") or {}).get("checkInAndOut") or {}).get("content") or []
+    times = {x.get("title"): x.get("description") for x in pol if x.get("title")}
+    amen = []
+    for cat in (det.get("hotelFacilityPopV2") or {}).get("hotelFacility") or []:
+        for grp in cat.get("categoryList") or []:
+            for f in grp.get("list") or []:
+                if f.get("facilityDesc") and f["facilityDesc"] not in amen:
+                    amen.append(f["facilityDesc"])
+    star = base.get("starInfo") or {}
+    return {"name": (base.get("nameInfo") or {}).get("name"), "stars": star.get("level"),
+            "stars_kind": star.get("type"), "address": pos.get("address"), "area": pos.get("zoneName"),
+            "transport": (pos.get("trafficInfo") or {}).get("trafficDesc"),
+            "rating": num(com.get("score")), "reviews": com.get("totalComment"),
+            "checkin_time": times.get("入住："), "checkout_time": times.get("退房時間："),
+            "amenities": amen[:40], "saved": base.get("isFavoriteHotel"),
+            "logged_in": (det.get("authInfo") or {}).get("isLogin")}
+
+
+def cmd_hotel(args):
+    hid = hotel_id(args.ref)
+    _, _, nights = stay(args)
+    with Client(args) as cl:
+        info = hotel_static(cl, hid, args)
+        rooms = parse_rooms(cl.soa(SOA + "/33269/getHotelRoomListOversea", rooms_body(cl, hid, args)), nights)
+    out = {"id": str(hid), "checkin": args.checkin, "checkout": args.checkout, "nights": nights,
+           "adults": args.adults, "children": args.children, "rooms_requested": args.rooms, **info, **rooms,
+           "price_basis": "price_total = the rate's stay total for the whole party (comparingAmount, equal to "
+                          "the page's 總額), 含稅項及費用; price_per_night = price_total / nights. Only rates "
+                          "the site shows for this party are listed; hidden_rates were dropped by the site for "
+                          "not fitting the party.",
+           "url": hotel_url(hid, args)}
+
+    def human():
+        L = [f"{out.get('name') or hid}  ★{out.get('stars') or '?'}  {out.get('rating') or '?'}/10 "
+             f"({out.get('reviews') or 0} reviews)",
+             f"{out.get('address') or ''}  [{out.get('area') or ''}]",
+             f"check-in {out.get('checkin_time') or '?'}  check-out {out.get('checkout_time') or '?'}  "
+             f"saved={out.get('saved')}",
+             "amenities: " + (", ".join((out.get("amenities") or [])[:12]) or "-")]
+        if out.get("cheapest"):
+            c = out["cheapest"]
+            L.append(f"cheapest: {c['room']} {money(c['price_total'], cl.currency)} total "
+                     f"({money(c['price_per_night'], cl.currency)}/night) {c.get('cancellation') or ''}")
+        if out.get("sold_out"):
+            L.append("SOLD OUT for these dates/party")
+        for rm in out["rooms"]:
+            L.append(f"\n[{rm['room_id']}] {rm['name']}  {rm['beds'] or ''}  {rm['size'] or ''}")
+            for rt in rm["rates"]:
+                L.append(f"  {money(rt['price_total'], cl.currency):>11} total  {money(rt['price_per_night'], cl.currency)}"
+                         f"/night  max {rt['max_guests']}  {rt['breakfast'] or '無早餐資訊'}  {rt['cancellation'] or ''}"
+                         f"  {rt['payment'] or ''}  left {rt['rooms_left']}{'  +可能額外收費' if rt['extra_charges_possible'] else ''}")
+        if out["hidden_rates"]:
+            L.append(f"\n({out['hidden_rates']} rate(s) hidden by the site: {'; '.join(out['hidden_reason'] or [])})")
+        return "\n".join(L)
+    return emit(ok(out), args.json, human)
+
+
+def cmd_price(args):
+    _, _, nights = stay(args)
+    rows = []
+    with Client(args) as cl:
+        for ref in args.refs:
+            hid = hotel_id(ref)
+            try:
+                r = parse_rooms(cl.soa(SOA + "/33269/getHotelRoomListOversea", rooms_body(cl, hid, args)), nights)
+                c = r["cheapest"]
+                rows.append({"id": str(hid), "found": bool(c), "lowest_total": c and c["price_total"],
+                             "lowest_per_night": c and c["price_per_night"], "room": c and c["room"],
+                             "breakfast": c and c["breakfast"], "cancellation": c and c["cancellation"],
+                             "currency": cl.currency, "sold_out": r["sold_out"], "checked_at": int(time.time())})
+            except (ApiError, Blocked) as e:
+                rows.append({"id": str(hid), "found": False, "error": str(e), "checked_at": int(time.time())})
+    return emit(ok({"checkin": args.checkin, "checkout": args.checkout, "nights": nights,
+                    "price_basis": "lowest bookable shown rate, stay total incl. taxes/fees", "items": rows}),
+                args.json, lambda: table(
+                    [[r["id"], money(r.get("lowest_total"), cl.currency), money(r.get("lowest_per_night"), cl.currency),
+                      clip(r.get("room"), 24), clip(r.get("cancellation") or r.get("error") or "", 40)] for r in rows],
+                    ["id", "total", "/night", "room", "note"]))
+
+
+def cmd_raw(args):
+    url = args.path if args.path.startswith("http") else ORIGIN + "/" + args.path.lstrip("/")
+    u = urllib.parse.urlparse(url)
+    if not (u.hostname or "").endswith("trip.com"):
+        raise Usage("raw only talks to *.trip.com")
+    if re.search(r"book|checkout|order|pay|reserv|hold", u.path, re.I):
+        raise Usage("raw refuses booking/checkout/order/payment paths")
+    with Client(args) as cl:
+        code, text = cl.get(url)
+    try:
+        body = json.loads(text)
+    except ValueError:
+        body = text[:20000]
+    return emit(ok({"http": code, "url": url, "body": body}), True)
+
+
+# --------------------------------------------------------------- session
+def account_info(cl):
+    d = cl.soa(SOA + "/27024/ssoIsLoginAndGetAccountInfo", {"head": cl.head()}, data_key=None)
+    if d.get("isLogin") != "T":
+        raise Auth(f"session rejected by Trip.com ({d.get('message') or 'isLogin != T'}) - run `trip login`")
+    out = {"logged_in": True, "email": d.get("maskedEmail"), "linked": d.get("thirdTypes"), "message": d.get("message")}
+    try:
+        u = cl.soa(SOA + "/27024/getUserInfo", {"locale": "zh-TW", "accessCode": "IBUPCAUTEHNTICATE",
+                                                 "head": cl.account_head()}, data_key=None)
+        g = u.get("vipGrade")
+        ui = u.get("thisUserInfo") or {}
+        out.update(vip_grade=g, tier=VIP.get(g, f"grade {g} (label unverified)" if g is not None else None),
+                   nickname=ui.get("nickName") or None)
+    except (ApiError, Auth) as e:
+        out["tier_error"] = str(e)
+    return out
+
+
+def login_from_browser(args):
+    cookies, ua = edge_cookies()
+    if signed_in(cookies):
+        return cookies, ua
+    br = Browser(ORIGIN + "/account/signin?locale=zh-TW", debug=args.debug)
+    try:
+        print(f"Sign in to Trip.com in the new background tab of the browser on {CDP} (switch to it yourself; "
+              f"this CLI never types passwords). Waiting up to {args.wait}s...", file=sys.stderr)
+        t0 = time.time()
+        while time.time() - t0 < args.wait:
+            time.sleep(4)
+            cookies, ua = edge_cookies()
+            if signed_in(cookies):
+                return cookies, ua
+        raise Auth(f"not signed in after {args.wait}s; run `trip login` again")
+    finally:
+        br.close()
+
+
+def _clipboard():
+    for cmd in (["wl-paste", "-n"], ["pbpaste"], ["xclip", "-o", "-selection", "clipboard"]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    raise Auth("clipboard is empty or no clipboard tool (wl-paste / pbpaste / xclip)")
+
+
+def _read_cookie_tty():
+    import termios
+    fd = sys.stdin.fileno()
+    old, new = termios.tcgetattr(fd), termios.tcgetattr(fd)
+    new[3] &= ~(termios.ICANON | termios.ECHO)
+    new[6][termios.VMIN], new[6][termios.VTIME] = 1, 0
+    print("paste the Cookie header, then press Enter (input hidden):", file=sys.stderr)
+    buf = bytearray()
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        while True:
+            ch = os.read(fd, 65536)
+            if not ch:
+                break
+            if b"\x03" in ch:
+                raise KeyboardInterrupt
+            buf += ch
+            if b"\r" in ch or b"\n" in ch:
+                break
+    finally:
+        termios.tcsetattr(fd, termios.TCSANOW, old)
+        print(file=sys.stderr)
+    return buf.decode("utf-8", "replace").splitlines()[0] if buf else ""
+
+
+def cmd_login(args):
+    if args.from_clipboard or args.cookie_stdin:
+        raw = _clipboard() if args.from_clipboard else (_read_cookie_tty() if sys.stdin.isatty() else sys.stdin.read())
+        cookies, ua = header_to_cookies(clean_cookie(raw)), os.environ.get("TRIP_UA") or DEFAULT_UA
+        src = "clipboard" if args.from_clipboard else "stdin"
+    else:
+        cookies, ua = login_from_browser(args)
+        src = f"browser {CDP}"
+    st = {"cookies": cookies, "ua": ua}
+    with Client(argparse.Namespace(via="http", debug=args.debug, currency=args.currency), st) as cl:
+        who = account_info(cl)
+    st2 = load_state()
+    st2.pop("source", None)
+    if st2.get("keyring_parts"):
+        keyring_clear(st2["keyring_parts"])
+    for k in ("keyring_parts", "keyring_error"):
+        st2.pop(k, None)
+    st2.update(cookies=cookies, ua=ua, cookie_in_keyring=bool(args.keyring), user=who,
+               logged_in_at=int(time.time()), login_source=src)
+    if args.keyring:
+        st2["keyring_parts"] = keyring_save(cookies)
+        if keyring_load(st2["keyring_parts"]) != cookies:
+            raise Auth("keyring did not return the session it was given; use the state file")
+    save_state(st2)
+    out = {"user": who, "stored": "keyring" if args.keyring else STATE_FILE, "cookies": len(cookies)}
+    return emit(ok(out), args.json, lambda: f"signed in as {who.get('email')} ({who.get('tier') or 'tier ?'}); "
+                f"session ({len(cookies)} cookies) saved to {out['stored']}")
+
+
+def cmd_logout(args):
+    st = load_state()
+    if st.get("cookie_in_keyring"):
+        keyring_clear(st.get("keyring_parts"))
+    for k in ("cookies", "cookie_in_keyring", "keyring_parts", "keyring_error", "user", "logged_in_at",
+              "login_source", "source", "ua"):
+        st.pop(k, None)
+    save_state(st)
+    return emit(ok({"logged_out": True}), args.json, "session removed (Edge is not touched)")
+
+
+def need_session():
+    st = load_state()
+    if not signed_in(st.get("cookies")):
+        raise Auth(st.get("keyring_error") or "not signed in - run `trip login`")
+    return st
+
+
+def cmd_whoami(args):
+    st = need_session()
+    with Client(argparse.Namespace(via=args.via, debug=args.debug, currency=args.currency), st) as cl:
+        who = account_info(cl)
+    who["source"] = st.get("source")
+    return emit(ok(who), args.json, lambda: (
+        f"{who.get('email')}  member tier: {who.get('tier') or '?'}  linked: {','.join(who.get('linked') or [])}\n"
+        f"session via {who['source']} (verified live: {who.get('message')})"))
+
+
+def cmd_doctor(args):
+    checks = []
+    st = load_state()
+    checks.append(["state", "ok" if os.path.exists(STATE_FILE) else "-", STATE_FILE])
+    try:
+        ver = _http_json("/json/version")
+        checks.append(["cdp", "ok", f"{CDP} {ver.get('Browser')} (needed for login/saved add-rm/--via browser)"])
+    except Net as e:
+        checks.append(["cdp", "-", str(e)])
+    with Client(argparse.Namespace(via="http", debug=args.debug, currency=args.currency), st) as cl:
+        try:
+            n = len(keywords(cl, "東京"))
+            checks.append(["typeahead (http)", "ok" if n else "FAIL", f"getHotelKeywords 東京: {n} match(es)"])
+        except (Net, ApiError, Auth) as e:
+            checks.append(["typeahead (http)", "FAIL", str(e)])
+        if signed_in(st.get("cookies")):
+            try:
+                who = account_info(cl)
+                checks.append(["login", "ok", f"{who.get('email')} {who.get('tier') or ''} via {st.get('source')}"])
+            except (Net, ApiError, Auth) as e:
+                checks.append(["login", "FAIL", str(e)])
+        else:
+            checks.append(["login", "FAIL", "no session: search/hotel/price need `trip login` (measured: empty "
+                                             "anti-bot replies without one)"])
+    bad = any(c[1] == "FAIL" for c in checks)
+    payload = err("doctor found problems", EX_AUTH if checks[-1][1] == "FAIL" else EX_NET, checks=checks) \
+        if bad else ok({"checks": checks})
+    return emit(payload, args.json, lambda: table(checks, ["check", "state", "detail"]))
+
+
+# -------------------------------------------------------------- trips/saved
+def cmd_trips(args):
+    st = need_session()
+    with Client(argparse.Namespace(via=args.via, debug=args.debug, currency=args.currency), st) as cl:
+        body = {"BizTypes": [], "Offset": "", "Count": args.limit, "OrderStatusClassify": args.status,
+                "FilterValidOrder": False, "NeedOrderAmountDetail": True, "BeginBookingDateTime": "",
+                "EndBookingDateTime": "", "tabs": [], "listOrderField": "UsedTime", "byAscend": True,
+                "Locale": "zh-TW", "Currency": cl.currency, "ClientVersion": "99.99", "Channel": "IBUOnline",
+                "head": cl.account_head()}
+        d = cl.soa("https://online.trip.com/restapi/soa2/26974/getAllOrders.json", body, data_key=None)
+    orders = []
+    for o in d.get("OrderEnities") or []:
+        hotels = [{"hotel_id": h.get("HotelID"), "name": h.get("ProductName"), "checkin": ms_date(h.get("CheckInDate")),
+                   "checkout": ms_date(h.get("CheckOutDate")), "nights": h.get("NightAmount"),
+                   "rooms": h.get("RoomAmount"), "room_type": h.get("RoomType"), "city": h.get("ToCityName"),
+                   "address": h.get("HotelAddress")} for h in o.get("HotelOrderItems") or []]
+        orders.append({"order_id": str(o.get("OrderID")), "type": o.get("BizType"), "name": o.get("OrderName"),
+                       "status": o.get("OrderStatusName"), "total": o.get("OrderTotalPrice"),
+                       "currency": o.get("Currency"), "booked_on": ms_date(o.get("BookingDate")), "hotels": hotels})
+    out = {"status_filter": args.status, "count": len(orders), "orders": orders,
+           "note": "read-only: online.trip.com getAllOrders (the 我的訂單 page's own call)"}
+    return emit(ok(out), args.json, lambda: table(
+        [[o["order_id"], clip(o["name"], 24), o["status"], money(o["total"], o["currency"] or "TWD"),
+          (o["hotels"][0]["checkin"] + "→" + o["hotels"][0]["checkout"]) if o["hotels"] else "",
+          clip(o["hotels"][0]["room_type"], 16) if o["hotels"] else ""] for o in orders],
+        ["order", "name", "status", "total", "dates", "room"]))
+
+
+def favourites(cl):
+    body = {"QueryList": [{"BizType": "HOTEL"}], "ReturnCount": 100, "Locale": "zh-TW", "Currency": cl.currency,
+            "ClientVersion": "99.99", "Channel": "IBUOnline", "head": cl.account_head()}
+    d = cl.soa("https://www.trip.com/restapi/soa2/26974/json/GetMyFavorites", body, data_key=None)
+    if "TotalRecord" not in d and "FavoriteList" not in d:
+        raise ApiError("GetMyFavorites returned no list", {"body": json.dumps(d)[:300]})
+    items = [{"favorite_id": f.get("FavoriteID"), "id": str(f.get("ProductID")), "name": f.get("ProductName"),
+              "area": f.get("Zone"), "created": ms_date(f.get("CreateTime"))} for f in d.get("FavoriteList") or []]
+    return {"total": d.get("TotalRecord", len(items)), "items": items}
+
+
+FAV_BTN = "div[class*=collectButton_hotelOverview_collectBtn]"
+
+
+def cmd_saved(args):
+    st = need_session()
+    cl = Client(argparse.Namespace(via="http", debug=args.debug, currency=args.currency), st)
+    if args.action == "list":
+        fav = favourites(cl)
+        return emit(ok(fav), args.json, lambda: (f"{fav['total']} saved hotel(s)\n" + table(
+            [[i["id"], clip(i["name"], 30), i["area"], i["created"]] for i in fav["items"]],
+            ["id", "name", "area", "saved on"])) if fav["items"] else "no saved hotels")
+    if not args.ref:
+        raise Usage("saved add/rm needs a hotel id or URL")
+    hid = str(hotel_id(args.ref))
+    before = favourites(cl)
+    is_saved = any(i["id"] == hid for i in before["items"])
+    want = args.action == "add"
+    if is_saved == want:
+        return emit(ok({"id": hid, "saved": is_saved, "changed": False}), args.json,
+                    f"{hid} is already {'saved' if is_saved else 'not saved'}; nothing to do")
+    if not args.yes:
+        return emit(ok({"dry_run": True, "id": hid, "action": args.action, "currently_saved": is_saved,
+                        "saved_total": before["total"]}), args.json,
+                    f"would {args.action} {hid} (currently saved={is_saved}); re-run with --yes")
+    d1 = (dt.date.today() + dt.timedelta(days=30)).isoformat()
+    d2 = (dt.date.today() + dt.timedelta(days=31)).isoformat()
+    url = hotel_url(int(hid), argparse.Namespace(checkin=d1, checkout=d2, adults=2, children=[], rooms=1,
+                                                 currency=cl.currency))
+    with Browser(url, debug=args.debug) as br:
+        br.p.call("Emulation.setFocusEmulationEnabled", enabled=True)  # our own tab only; lets it hydrate
+        state_js = ("(()=>{const b=document.querySelector(%s);const i=b&&b.querySelector('i');"
+                    "return !b?'none':(/collectIcon_selected/.test(i&&i.className)?'on':'off')})()" % json.dumps(FAV_BTN))
+        ui = None
+        for _ in range(15):
+            ui = br.eval(state_js)
+            if ui in ("on", "off"):
+                break
+            time.sleep(1)
+        if ui not in ("on", "off"):
+            raise ApiError("could not find the 收藏 button on the hotel page")
+        clicked_ui = None
+        if (ui == "on") != want:
+            time.sleep(5)  # measured: an immediate click on a just-loaded tab did nothing
+            br.eval("document.querySelector(%s).click()" % json.dumps(FAV_BTN))  # exactly one click
+            for _ in range(10):
+                time.sleep(1)
+                clicked_ui = br.eval(state_js)
+                if (clicked_ui == "on") == want:
+                    break
+    after = None
+    for _ in range(8):
+        time.sleep(2)
+        after = favourites(cl)
+        if any(i["id"] == hid for i in after["items"]) == want:
+            break
+    now = any(i["id"] == hid for i in after["items"])
+    if now != want:
+        raise ApiError(f"clicked 收藏 once but the server list still says saved={now} (button now "
+                       f"{clicked_ui}) - check `trip saved list`", {"saved_total": after["total"]})
+    return emit(ok({"id": hid, "saved": now, "changed": True, "verified": "GetMyFavorites re-read",
+                    "saved_total": after["total"]}), args.json,
+                f"{hid} is now {'saved' if now else 'not saved'} (verified by re-reading the list; {after['total']} saved)")
+
+
+# ------------------------------------------------------------------ parser
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        as_json = "--json" in sys.argv
+        emit(err(f"{self.prog}: {message}", EX_USAGE), as_json)
+        if not as_json:
+            self.print_usage(sys.stderr)
+        sys.exit(EX_USAGE)
+
+
+def csv_ints(s):
+    try:
+        return [int(x) for x in str(s).split(",") if x.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected comma-separated numbers, got {s!r}")
+
+
+def add_party(p):
+    p.add_argument("--checkin", required=True)
+    p.add_argument("--checkout", required=True)
+    p.add_argument("--adults", type=int, default=2)
+    p.add_argument("--children", type=csv_ints, default=[], help="ages, comma separated, e.g. 7,4")
+    p.add_argument("--rooms", type=int, default=1)
+
+
+def build_parser():
+    p = Parser(prog="trip", description="Trip.com Taiwan (tw.trip.com) hotels from the shell (no booking).")
+    p.add_argument("--version", action="version", version=VERSION)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="stable {ok, data|error} envelope")
+    common.add_argument("--debug", action="store_true", help="dump requests to stderr")
+    common.add_argument("--via", choices=["auto", "http", "browser"], default="auto",
+                        help="http = plain HTTPS with the saved session (default path); browser = fetch inside a "
+                             "background Edge tab; auto = http, browser only on an empty anti-bot reply")
+    common.add_argument("--cdp", default=None, help=f"CDP endpoint (default {CDP})")
+    common.add_argument("--currency", default="TWD", help="currency (default TWD; only TWD measured live)")
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=Parser)
+
+    sub.add_parser("doctor", parents=[common], help="transport, API reachability, login state").set_defaults(fn=cmd_doctor)
+
+    sg = sub.add_parser("suggest", parents=[common], help="typeahead / destination lookup")
+    sg.add_argument("text")
+    sg.add_argument("--limit", type=int, default=10)
+    sg.set_defaults(fn=cmd_suggest)
+
+    s = sub.add_parser("search", parents=[common], help="search hotels (prices = stay total incl. taxes)")
+    s.add_argument("destination", help="free text (resolved via typeahead) or a numeric Trip.com city id")
+    add_party(s)
+    s.add_argument("--country-id", type=int, default=0, help="only with a numeric city id")
+    s.add_argument("--sort", choices=list(SORTS))
+    s.add_argument("--page", type=int, default=1)
+    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--pool", type=int, default=100, help="price sorts: hotels read before re-sorting (default 100)")
+    s.add_argument("--min", type=float, help="min price per night (TWD, stay total / nights)")
+    s.add_argument("--max", type=float, help="max price per night (TWD, stay total / nights)")
+    s.add_argument("--stars", type=csv_ints, default=[], help="e.g. 3,4")
+    s.add_argument("--verify", action="store_true",
+                   help="re-check every shown row on the hotel's room list (1 extra call per row)")
+    s.add_argument("--free-cancel", action="store_true")
+    s.add_argument("--breakfast", action="store_true")
+    s.set_defaults(fn=cmd_search)
+
+    h = sub.add_parser("hotel", aliases=["rooms"], parents=[common], help="rooms/rates for one hotel")
+    h.add_argument("ref", help="hotel id or tw.trip.com hotel URL")
+    add_party(h)
+    h.set_defaults(fn=cmd_hotel)
+
+    pc = sub.add_parser("price", parents=[common], help="lowest total price for several hotels")
+    pc.add_argument("refs", nargs="+")
+    add_party(pc)
+    pc.set_defaults(fn=cmd_price)
+
+    lg = sub.add_parser("login", parents=[common], help="save a signed-in Trip.com session")
+    g = lg.add_mutually_exclusive_group()
+    g.add_argument("--from-browser", action="store_true", help="(default) copy the session from Edge on CDP")
+    g.add_argument("--from-clipboard", action="store_true", help="Cookie header from the clipboard")
+    g.add_argument("--cookie-stdin", action="store_true", help="paste/pipe a Cookie header")
+    lg.add_argument("--wait", type=int, default=300, help="seconds to wait for you to sign in")
+    lg.add_argument("--keyring", action="store_true", help="store cookies in the OS keyring")
+    lg.set_defaults(fn=cmd_login)
+    sub.add_parser("logout", parents=[common], help="delete the saved session").set_defaults(fn=cmd_logout)
+    sub.add_parser("whoami", parents=[common], help="verify the session live (email, member tier)"
+                   ).set_defaults(fn=cmd_whoami)
+
+    t = sub.add_parser("trips", parents=[common], help="read-only list of your orders/bookings")
+    t.add_argument("--status", default="All", choices=["All", "NotTravel", "AwaitPay", "AwaitReview"])
+    t.add_argument("--limit", type=int, default=20)
+    t.set_defaults(fn=cmd_trips)
+
+    sv = sub.add_parser("saved", parents=[common], help="saved hotels (收藏) list/add/rm; no booking")
+    sv.add_argument("action", choices=["list", "add", "rm"])
+    sv.add_argument("ref", nargs="?", help="add/rm: hotel id or URL")
+    sv.add_argument("--yes", action="store_true", help="really write; without it only preview")
+    sv.set_defaults(fn=cmd_saved)
+
+    r = sub.add_parser("raw", parents=[common], help="GET passthrough for debugging (JSON out)")
+    r.add_argument("path")
+    r.set_defaults(fn=cmd_raw)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if getattr(args, "cdp", None):
+        _set_cdp(args.cdp)
+    try:
+        return args.fn(args)
+    except Auth as e:
+        return emit(err(str(e), EX_AUTH), args.json)
+    except Net as e:
+        return emit(err(str(e), EX_NET), args.json)
+    except Usage as e:
+        return emit(err(str(e), EX_USAGE), args.json)
+    except ApiError as e:
+        return emit(err(str(e), EX_ERR, **(e.detail or {})), args.json)
+    except BrokenPipeError:
+        return EX_OK
+    except KeyboardInterrupt:
+        return EX_ERR
+
+
+if __name__ == "__main__":
+    sys.exit(main())

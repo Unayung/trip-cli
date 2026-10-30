@@ -10,17 +10,44 @@ Every command takes `--json` and returns `{ok, data|error}`. Exit codes: 0 ok, 1
 
 Trip.com's hotel services (`/restapi/soa2/...`, JSON POST) answer plain HTTPS normally **when the request carries a
 signed-in session cookie** (`cticket`). Without one they return 200 with an empty body (`ResultId 201`), even with
-the anti-bot headers the site's JS adds (measured 2026-10-30). So run `trip login` first: it copies the Trip.com
-cookies from your own Edge on CDP (`127.0.0.1:9222`, read-only) and checks them against the live account service.
+the anti-bot headers the site's JS adds (measured 2026-10-30). So run `trip login` first: it takes the `Cookie` header
+of your own signed-in browser session (see Login) and checks it against the live account service.
 
-After that, search/hotel/price/trips/saved-list all use plain HTTPS; Edge is not touched. Edge is needed only for
-`login`, `saved add/rm` (clicks the hotel page's own 收藏 button in a background tab) and `--via browser`.
+After that, search/hotel/price/trips/saved-list all use plain HTTPS; Edge is not touched. Edge on CDP 9222 is needed only for
+`login --from-browser`, `saved add/rm` (clicks the hotel page's own 收藏 button in a background tab) and `--via browser`.
 Background tabs are created with `Target.createTarget(background=true)`, never focused, and closed afterwards (if it
 is the last tab, it is blanked instead, so Edge does not quit). Run one command at a time.
 
 Locale: tw.trip.com pages set `ibulocale`/`ibulanguage`/`cookiePricesDisplayed` on `.trip.com`, which would switch
 your hk.trip.com tabs to Taiwan/TWD. The CLI only overrides those in its own HTTPS requests, and the browser path
 saves the three cookies before opening a tab and restores them after (verified: still `zh_hk`/`HKD` afterwards).
+
+## Login
+
+Trip.com signs in with a password (+ verification code), so the CLI never takes credentials. It logs in with
+the `Cookie` request header of a browser session you already have:
+
+1. In your browser: DevTools > Network > click any request to `tw.trip.com` > Request Headers.
+2. Copy the value of `Cookie:` (with or without the leading `Cookie: `).
+3. Run `trip login`. It reads the clipboard, or stdin when piped.
+
+```bash
+trip login                    # Cookie header from stdin (piped) or the clipboard;
+                              #   nothing usable there = exit 2 with these steps
+trip login --from-clipboard   # clipboard only
+trip login --cookie-stdin     # paste (hidden) or pipe it
+trip login --keyring          # store it in the OS keyring instead of the file
+trip login --from-browser     # opt-in: copy the session from Edge on CDP 9222; if signed out, opens
+                              #   the sign-in page in a background tab (--wait 300)
+trip whoami | logout
+```
+
+The header must contain the `cticket` cookie. It is checked against the live account service
+(`ssoIsLoginAndGetAccountInfo`) before saving to `~/.config/trip/state.json` (0600, `TRIP_HOME` moves it) or the
+OS keyring with `--keyring`. `TRIP_COOKIE` overrides both. Exit 3 means there is no valid session (or it
+expired): log in again.
+
+Edge on CDP 9222 is needed only for `login --from-browser`, `saved add/rm` and `--via browser`.
 
 ## Commands
 
@@ -78,8 +105,8 @@ e.g. 心齋橋 = landmark `13|6790054` in 大阪, city 219) or a numeric Trip.co
 
 ## Limitations
 
-- Needs a signed-in session for every hotel call (`trip login`). `login` with a signed-out Edge (opens the sign-in
-  page and waits) and `--from-clipboard`/`--keyring` were not run live.
+- Needs a signed-in session for every hotel call (`trip login`). `login --from-browser` with a signed-out Edge (opens the
+  sign-in page and waits) and `--keyring` were not run live.
 - `vipGrade` labels: only grade 1 = 白銀 was seen. `--sort rating|distance`, `--min/--max` and non-TWD currencies
   were not verified live. `--min/--max` filter on `price_per_night` client-side.
 - `saved add/rm` depends on the hotel page's 收藏 button (the write call itself was not visible to capture); the
